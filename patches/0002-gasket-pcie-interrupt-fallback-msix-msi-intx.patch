@@ -1,0 +1,147 @@
+--- a/gasket_interrupt.c	2026-01-31 12:59:33.381558064 -0800
++++ b/gasket_interrupt.c	2026-01-31 13:31:10.587831778 -0800
+@@ -55,6 +55,9 @@
+ 	/* The number of successfully configured interrupts. */
+ 	int num_configured;
+ 
++	/* Number of unique IRQ vectors allocated (may be < num_interrupts). */
++	int num_vectors;
++
+ 	/* The MSI-X data for each requested/configured interrupt. */
+ 	struct msix_entry *msix_entries;
+ 
+@@ -167,28 +170,30 @@
+ static irqreturn_t gasket_msix_interrupt_handler(int irq, void *dev_id)
+ {
+ 	struct gasket_interrupt_data *interrupt_data = dev_id;
+-	int interrupt = -1;
+ 	int i;
++	bool handled = false;
+ 
+-	/* If this linear lookup is a problem, we can maintain a map/hash. */
++	/*
++	 * When vectors are shared across interrupt entries (fewer vectors
++	 * than interrupts), process all entries that map to this IRQ.
++	 */
+ 	for (i = 0; i < interrupt_data->num_interrupts; i++) {
+ 		if (interrupt_data->msix_entries[i].vector == irq) {
+-			interrupt = interrupt_data->msix_entries[i].entry;
+-			break;
++			gasket_handle_interrupt(interrupt_data,
++						interrupt_data->msix_entries[i].entry);
++			handled = true;
+ 		}
+ 	}
+-	if (interrupt == -1) {
+-		pr_err("Received unknown irq %d\n", irq);
+-		return IRQ_HANDLED;
++	if (!handled) {
++		return IRQ_NONE;
+ 	}
+-	gasket_handle_interrupt(interrupt_data, interrupt);
+ 	return IRQ_HANDLED;
+ }
+ 
+ static int
+ gasket_interrupt_msix_init(struct gasket_interrupt_data *interrupt_data)
+ {
+-	int ret = 1;
++	int ret;
+ 	int i;
+ 
+ 	interrupt_data->msix_entries =
+@@ -203,32 +208,46 @@
+ 		interrupt_data->eventfd_ctxs[i] = NULL;
+ 	}
+ 
+-	/* Retry MSIX_RETRY_COUNT times if not enough IRQs are available. */
+-	for (i = 0; i < MSIX_RETRY_COUNT && ret > 0; i++)
+-		ret = pci_enable_msix_exact(interrupt_data->pci_dev,
+-					    interrupt_data->msix_entries,
+-					    interrupt_data->num_interrupts);
+-
+-	if (ret)
+-		return ret > 0 ? -EBUSY : ret;
++	/* Accept fewer vectors than interrupts; the Pi 5 PCIe host
++	 * cannot always allocate the full set.  Entries beyond
++	 * num_vectors share vectors via modulo mapping.
++	 */
++	ret = pci_alloc_irq_vectors(interrupt_data->pci_dev,
++				    1,
++				    interrupt_data->num_interrupts,
++				    PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX);
++	if (ret < 0)
++		return ret;
++	interrupt_data->num_vectors = ret;
+ 	interrupt_data->msix_configured = 1;
+ 
+-	for (i = 0; i < interrupt_data->num_interrupts; i++) {
++	dev_info(&interrupt_data->pci_dev->dev,
++		 "Allocated %d IRQ vectors for %d interrupts\n",
++		 interrupt_data->num_vectors,
++		 interrupt_data->num_interrupts);
++
++	/* Map every interrupt entry to an allocated vector. */
++	for (i = 0; i < interrupt_data->num_interrupts; i++)
++		interrupt_data->msix_entries[i].vector =
++			pci_irq_vector(interrupt_data->pci_dev,
++				       i % interrupt_data->num_vectors);
++
++	/* Register an IRQ handler for each unique vector. */
++	for (i = 0; i < interrupt_data->num_vectors; i++) {
+ 		ret = request_irq(interrupt_data->msix_entries[i].vector,
+-				  gasket_msix_interrupt_handler, 0,
++				  gasket_msix_interrupt_handler, IRQF_SHARED,
+ 				  interrupt_data->name, interrupt_data);
+-
+ 		if (ret) {
+ 			dev_err(&interrupt_data->pci_dev->dev,
+-				"Cannot get IRQ for interrupt %d, vector %d; "
+-				"%d\n",
+-				i, interrupt_data->msix_entries[i].vector, ret);
++				"Cannot get IRQ for vector %d; %d\n",
++				interrupt_data->msix_entries[i].vector, ret);
++			/* Track how many were registered for cleanup. */
++			interrupt_data->num_vectors = i;
+ 			return ret;
+ 		}
+-
+-		interrupt_data->num_configured++;
+ 	}
+ 
++	interrupt_data->num_configured = interrupt_data->num_interrupts;
+ 	return 0;
+ }
+ 
+@@ -248,7 +267,7 @@
+ #define MSIX_VECTOR_SIZE 16
+ #define MSIX_MASK_BIT_OFFSET 12
+ #define APEX_BAR2_REG_KERNEL_HIB_MSIX_TABLE 0x46800
+-	for (i = 0; i < gasket_dev->interrupt_data->num_configured; i++) {
++	for (i = 0; i < gasket_dev->interrupt_data->num_vectors; i++) {
+ 		/* Check if the MSIX vector is unmasked */
+ 		ulong location = APEX_BAR2_REG_KERNEL_HIB_MSIX_TABLE +
+ 				 MSIX_MASK_BIT_OFFSET + i * MSIX_VECTOR_SIZE;
+@@ -401,15 +420,19 @@
+ {
+ 	int i;
+ 
+-	for (i = 0; i < interrupt_data->num_configured; i++) {
++	/* Clear eventfds for all interrupt entries. */
++	for (i = 0; i < interrupt_data->num_configured; i++)
+ 		gasket_interrupt_clear_eventfd(interrupt_data, i);
++
++	/* Free only the unique IRQ vectors we registered. */
++	for (i = 0; i < interrupt_data->num_vectors; i++)
+ 		free_irq(interrupt_data->msix_entries[i].vector,
+ 			 interrupt_data);
+-	}
+ 	interrupt_data->num_configured = 0;
++	interrupt_data->num_vectors = 0;
+ 
+ 	if (interrupt_data->msix_configured)
+-		pci_disable_msix(interrupt_data->pci_dev);
++		pci_free_irq_vectors(interrupt_data->pci_dev);
+ 	interrupt_data->msix_configured = 0;
+ 	kfree(interrupt_data->msix_entries);
+ 	interrupt_data->msix_entries = NULL;

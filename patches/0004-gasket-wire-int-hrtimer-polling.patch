@@ -1,0 +1,126 @@
+Replace wire interrupt mask-register approach with hrtimer polling.
+
+On the Raspberry Pi 5, PCIe legacy INTx delivery via GICv2 SPIs is
+non-functional for ongoing interrupt signalling.  The TPU sets pending
+bits in WIRE_INT_PENDING_BIT_ARRAY but the INTx signal never reaches
+the GIC.  NVMe drives sharing the same legacy IRQ lines have the same
+problem and silently fall back to polling.
+
+This patch adds a 250 us hrtimer that polls the wire interrupt pending
+register and dispatches completions, replacing the mask-register
+unmasking that relied on working INTx delivery.
+
+Apply on top of patches 0001-0003.
+
+--- a/gasket_interrupt.c
++++ b/gasket_interrupt.c
+@@ -6,6 +6,7 @@
+ 
+ #include "gasket_constants.h"
+ #include "gasket_core.h"
+ #include "gasket_sysfs.h"
++#include <linux/hrtimer.h>
+ #include <linux/device.h>
+ #include <linux/interrupt.h>
+@@ -84,6 +85,9 @@
+ 
+ 	/* Back-pointer to owning gasket_dev for BAR access from IRQ. */
+ 	struct gasket_dev *gasket_dev;
++
++	/* High-resolution timer for polling wire interrupts. */
++	struct hrtimer wire_int_timer;
+ };
+ 
+ /* Structures to display interrupt counts in sysfs. */
+@@ -325,7 +329,43 @@
+ }
+ 
+ /*
+- * Detect INTx fallback mode and unmask wire interrupts.
++ * Poll wire interrupt pending register via hrtimer.
++ *
++ * On some platforms (e.g. Raspberry Pi 5) PCIe legacy INTx delivery
++ * is non-functional, so we poll instead.  Period is 250 us which adds
++ * negligible latency to inference calls that take several milliseconds.
++ */
++static enum hrtimer_restart gasket_wire_int_poll_fn(struct hrtimer *timer)
++{
++	struct gasket_interrupt_data *int_data =
++		container_of(timer, struct gasket_interrupt_data, wire_int_timer);
++	struct gasket_dev *gdev = int_data->gasket_dev;
++	u64 pending;
++	int i;
++
++	if (!int_data->using_wire_int)
++		return HRTIMER_NORESTART;
++
++	pending = gasket_dev_read_64(gdev,
++				     int_data->interrupt_bar_index,
++				     int_data->wire_int_pending_reg);
++	if (pending) {
++		for (i = 0; i < int_data->num_interrupts; i++) {
++			if (pending & BIT_ULL(i))
++				gasket_handle_interrupt(int_data, i);
++		}
++		/* Write-1-to-clear the pending bits we handled. */
++		gasket_dev_write_64(gdev, pending,
++				    int_data->interrupt_bar_index,
++				    int_data->wire_int_pending_reg);
++	}
++
++	hrtimer_forward_now(timer, ns_to_ktime(250000));
++	return HRTIMER_RESTART;
++}
++
++/*
++ * Detect INTx fallback mode and start wire interrupt polling.
+  * Called after gasket_interrupt_msix_init() during init and reinit.
+  */
+ static void gasket_wire_int_setup(struct gasket_dev *gasket_dev)
+@@ -347,13 +387,26 @@
+ 
+ 	interrupt_data->using_wire_int = true;
+ 
+-	/* Unmask all wire interrupts (bit=1 means masked). */
+-	gasket_dev_write_64(gasket_dev, 0,
+-			    interrupt_data->interrupt_bar_index,
+-			    interrupt_data->wire_int_mask_reg);
++	/* Clear any stale pending bits (W1C). */
++	{
++		u64 stale = gasket_dev_read_64(gasket_dev,
++				interrupt_data->interrupt_bar_index,
++				interrupt_data->wire_int_pending_reg);
++		if (stale)
++			gasket_dev_write_64(gasket_dev, stale,
++					interrupt_data->interrupt_bar_index,
++					interrupt_data->wire_int_pending_reg);
++	}
++
++	/* Start polling timer (250 us period). */
++	hrtimer_init(&interrupt_data->wire_int_timer,
++		     CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	interrupt_data->wire_int_timer.function = gasket_wire_int_poll_fn;
++	hrtimer_start(&interrupt_data->wire_int_timer,
++		      ns_to_ktime(250000), HRTIMER_MODE_REL);
+ 
+ 	dev_info(gasket_dev->dev,
+-		 "INTx mode: unmasked wire interrupts (pending=0x%lx mask=0x%lx)\n",
++		 "INTx mode: polling wire interrupts (pending=0x%lx mask=0x%lx)\n",
+ 		 interrupt_data->wire_int_pending_reg,
+ 		 interrupt_data->wire_int_mask_reg);
+ }
+@@ -495,10 +548,8 @@
+ {
+ 	int i;
+ 
+-	/* Re-mask wire interrupts before tearing down IRQs. */
+-	if (interrupt_data->using_wire_int && interrupt_data->gasket_dev) {
+-		gasket_dev_write_64(interrupt_data->gasket_dev, ~0ULL,
+-				    interrupt_data->interrupt_bar_index,
+-				    interrupt_data->wire_int_mask_reg);
++	/* Stop wire interrupt polling before tearing down IRQs. */
++	if (interrupt_data->using_wire_int) {
+ 		interrupt_data->using_wire_int = false;
++		hrtimer_cancel(&interrupt_data->wire_int_timer);
+ 	}
+

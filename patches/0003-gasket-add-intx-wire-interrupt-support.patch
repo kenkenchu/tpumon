@@ -1,0 +1,174 @@
+Wire (INTx) interrupt support for Edge TPU gasket driver.
+
+When MSI-X is disabled at PCI level and the kernel falls back to INTx,
+the Edge TPU's wire interrupt path (WIRE_INT_PENDING_BIT_ARRAY and
+WIRE_INT_MASK_ARRAY registers) must be unmasked, otherwise the TPU never
+asserts INTx and inference hangs.
+
+This patch:
+- Adds wire_int_pending_reg and wire_int_mask_reg fields to
+  gasket_driver_desc so device drivers can declare their wire interrupt
+  register offsets.
+- Detects INTx fallback in gasket_interrupt_init/reinit and unmarks wire
+  interrupts.
+- Adds a hardware-level pending-bit check in the interrupt handler for
+  shared-IRQ identification (returns IRQ_NONE when pending register is 0,
+  avoiding spurious eventfd signals from NVMe or other devices sharing
+  the same IRQ line).
+- Re-masks wire interrupts on cleanup.
+- Sets the Apex wire interrupt register offsets in apex_desc.
+
+--- a/gasket_core.h
++++ b/gasket_core.h
+@@ -404,6 +404,15 @@
+ 	 */
+ 	int interrupt_pack_width;
+ 
++	/*
++	 * BAR offset of the wire (INTx) interrupt pending-bit register.
++	 * Set to 0 if wire interrupts are not supported by this device.
++	 */
++	ulong wire_int_pending_reg;
++
++	/* BAR offset of the wire (INTx) interrupt mask register. */
++	ulong wire_int_mask_reg;
++
+ 	/* Driver callback functions - all may be NULL */
+ 	/*
+ 	 * device_open_cb: Callback for when a device node is opened in write
+--- a/gasket_interrupt.c
++++ b/gasket_interrupt.c
+@@ -72,6 +72,18 @@
+ 
+ 	/* Linux IRQ number. */
+ 	int irq;
++
++	/* True when using wire (INTx) interrupts instead of MSI-X. */
++	bool using_wire_int;
++
++	/* BAR offset of wire interrupt pending-bit register (0 = N/A). */
++	ulong wire_int_pending_reg;
++
++	/* BAR offset of wire interrupt mask register. */
++	ulong wire_int_mask_reg;
++
++	/* Back-pointer to owning gasket_dev for BAR access from IRQ. */
++	struct gasket_dev *gasket_dev;
+ };
+ 
+ /* Structures to display interrupt counts in sysfs. */
+@@ -170,7 +182,31 @@
+ 	int i;
+ 	bool handled = false;
+ 
++	/* Wire (INTx) interrupt path: check hardware pending register. */
++	if (interrupt_data->using_wire_int) {
++		u64 pending;
++		struct gasket_dev *gdev = interrupt_data->gasket_dev;
++
++		pending = gasket_dev_read_64(
++			gdev, interrupt_data->interrupt_bar_index,
++			interrupt_data->wire_int_pending_reg);
++		if (!pending)
++			return IRQ_NONE;
++
++		for (i = 0; i < interrupt_data->num_interrupts; i++) {
++			if (pending & BIT_ULL(i))
++				gasket_handle_interrupt(interrupt_data, i);
++		}
++
++		/* Write-1-to-clear the pending bits we handled. */
++		gasket_dev_write_64(gdev, pending,
++				    interrupt_data->interrupt_bar_index,
++				    interrupt_data->wire_int_pending_reg);
++		return IRQ_HANDLED;
++	}
++
+ 	/*
+-	 * When vectors are shared across interrupt entries (fewer vectors
+-	 * than interrupts), process all entries that map to this IRQ.
++	 * MSI-X path: when vectors are shared across interrupt entries
++	 * (fewer vectors than interrupts), process all entries that map
++	 * to this IRQ.
+ 	 */
+@@ -288,3 +318,34 @@
+ }
+ 
++/*
++ * Detect INTx fallback mode and unmask wire interrupts.
++ * Called after gasket_interrupt_msix_init() during init and reinit.
++ */
++static void gasket_wire_int_setup(struct gasket_dev *gasket_dev)
++{
++	struct gasket_interrupt_data *interrupt_data =
++		gasket_dev->interrupt_data;
++	struct pci_dev *pdev = interrupt_data->pci_dev;
++
++	interrupt_data->using_wire_int = false;
++
++	if (!pdev || interrupt_data->wire_int_pending_reg == 0)
++		return;
++
++	if (pdev->msix_enabled || pdev->msi_enabled)
++		return;
++
++	interrupt_data->using_wire_int = true;
++
++	/* Unmask all wire interrupts (bit=1 means masked). */
++	gasket_dev_write_64(gasket_dev, 0,
++			    interrupt_data->interrupt_bar_index,
++			    interrupt_data->wire_int_mask_reg);
++
++	dev_info(gasket_dev->dev,
++		 "INTx mode: unmasked wire interrupts (pending=0x%lx mask=0x%lx)\n",
++		 interrupt_data->wire_int_pending_reg,
++		 interrupt_data->wire_int_mask_reg);
++}
++
+ static ssize_t interrupt_sysfs_show(struct device *device,
+@@ -362,4 +416,8 @@
+ 	interrupt_data->interrupt_bar_index = driver_desc->interrupt_bar_index;
+ 	interrupt_data->pack_width = driver_desc->interrupt_pack_width;
++	interrupt_data->gasket_dev = gasket_dev;
++	interrupt_data->wire_int_pending_reg =
++		driver_desc->wire_int_pending_reg;
++	interrupt_data->wire_int_mask_reg = driver_desc->wire_int_mask_reg;
+ 
+ 	interrupt_data->eventfd_ctxs = kcalloc(driver_desc->num_interrupts,
+@@ -389,5 +447,6 @@
+ 		if (ret)
+ 			break;
+ 		force_msix_interrupt_unmasking(gasket_dev);
++		gasket_wire_int_setup(gasket_dev);
+ 		break;
+ 
+@@ -419,5 +478,13 @@
+ {
+ 	int i;
+ 
++	/* Re-mask wire interrupts before tearing down IRQs. */
++	if (interrupt_data->using_wire_int && interrupt_data->gasket_dev) {
++		gasket_dev_write_64(interrupt_data->gasket_dev, ~0ULL,
++				    interrupt_data->interrupt_bar_index,
++				    interrupt_data->wire_int_mask_reg);
++		interrupt_data->using_wire_int = false;
++	}
++
+ 	/* Clear eventfds for all interrupt entries. */
+ 	for (i = 0; i < interrupt_data->num_configured; i++)
+@@ -455,5 +521,6 @@
+ 		if (ret)
+ 			break;
+ 		force_msix_interrupt_unmasking(gasket_dev);
++		gasket_wire_int_setup(gasket_dev);
+ 		break;
+ 
+--- a/apex_driver.c
++++ b/apex_driver.c
+@@ -1197,4 +1197,6 @@
+ 	.interrupts = apex_interrupts,
+ 	.interrupt_pack_width = 7,
++	.wire_int_pending_reg = APEX_BAR2_REG_KERNEL_WIRE_INT_PENDING_BIT_ARRAY,
++	.wire_int_mask_reg = APEX_BAR2_REG_KERNEL_WIRE_INT_MASK_ARRAY,
+ 
+ 	.device_open_cb = apex_device_open_cb,

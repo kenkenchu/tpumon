@@ -1,0 +1,26 @@
+[project]
+name = "edge-tpu"
+version = "0.1.0"
+description = "Coral Edge TPU demos for Raspberry Pi 5"
+requires-python = ">=3.11"
+dependencies = [
+    "tflite-runtime",
+    "numpy<2",
+    "Pillow",
+    "yfinance",
+    "textual>=1.0.0",
+]
+
+[project.scripts]
+tpumon = "tpumon:main"
+
+[project.optional-dependencies]
+train = ["tensorflow>=2.13,<2.17"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["regime"]
+py-modules = ["tpumon"]
