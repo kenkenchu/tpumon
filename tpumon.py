@@ -38,7 +38,7 @@ MODELS_DIR = Path(__file__).resolve().parent / "models"
 DEFAULT_MODEL = MODELS_DIR / "regime_model_quant_edgetpu.tflite"
 
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
-DEFAULT_ACTIVITY_MAX = 10_000  # interrupts/sec for 100% activity gauge
+ACTIVITY_MAX_FLOOR = 50.0  # Minimum scale for activity gauge auto-calibration
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -789,7 +789,8 @@ class TpuMonApp(App):
         self._prev_vectors: list[int] | None = None
         self._prev_irq_count: int | None = None
         self._prev_timestamp: float | None = None
-        self._activity_max = float(DEFAULT_ACTIVITY_MAX)
+        self._activity_max = ACTIVITY_MAX_FLOOR
+        self._excess_history: deque = deque(maxlen=60)
         self._irq_rate: float = 0.0
         self._activity_pct: float = 0.0
 
@@ -836,13 +837,14 @@ class TpuMonApp(App):
         metrics = self._poller.poll()
 
         # Compute activity from per-vector interrupt deltas.
-        # The hrtimer polls all vectors uniformly (~7500/s each), so the
+        # The hrtimer polls all vectors uniformly (~4000/s each), so the
         # raw total always looks busy.  Real TPU work causes specific
         # vectors (doorbell / completion) to increment *faster* than the
         # baseline.  We use the median per-vector delta as the baseline
         # and sum the excess above it as the activity signal.
         now = metrics.timestamp
         vectors = metrics.interrupt_vectors
+        excess = 0.0
         if self._prev_vectors is not None and self._prev_timestamp is not None:
             dt = now - self._prev_timestamp
             if dt > 0 and len(vectors) == len(self._prev_vectors):
@@ -852,9 +854,16 @@ class TpuMonApp(App):
                 ]
                 baseline = statistics.median(deltas) if deltas else 0.0
                 excess = sum(max(0.0, d - baseline) for d in deltas)
-                self._activity_pct = activity_percent(
-                    excess, self._activity_max
-                )
+
+        # Auto-scale activity max from recent excess rates.
+        # Use the peak excess from the last 60 polls to set the 100%
+        # mark.  This adapts to the current workload: single inferences
+        # register clearly, while sustained bursts scale the gauge up.
+        self._excess_history.append(excess)
+        observed_max = max(self._excess_history)
+        self._activity_max = max(observed_max * 1.25, ACTIVITY_MAX_FLOOR)
+        self._activity_pct = activity_percent(excess, self._activity_max)
+
         self._prev_vectors = vectors
         self._prev_timestamp = now
 
@@ -947,7 +956,7 @@ class TpuMonApp(App):
             if self._bench_stats.total_inferences == 100:
                 if self._activity_pct > 0:
                     current_excess = self._activity_pct / 100.0 * self._activity_max
-                    self._activity_max = max(current_excess * 1.25, DEFAULT_ACTIVITY_MAX)
+                    self._activity_max = max(current_excess * 1.25, ACTIVITY_MAX_FLOOR)
 
     def action_toggle_bench(self) -> None:
         self.bench_running = not self.bench_running
